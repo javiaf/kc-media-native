@@ -1,17 +1,3 @@
-/*
- * (C) Copyright 2013 Kurento (http://kurento.org/)
- *
- * All rights reserved. This program and the accompanying materials
- * are made available under the terms of the GNU Lesser General Public License
- * (LGPL) version 2.1 which accompanies this distribution, and is available at
- * http://www.gnu.org/licenses/lgpl-2.1.html
- *
- * This library is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
- * Lesser General Public License for more details.
- *
- */
 
 #include "VideoTx.h"
 #include "MediaPortManager.h"
@@ -131,6 +117,105 @@ VideoTx::VideoTx(const char* outfile, int width, int height,
 	}
 }
 
+VideoTx::VideoTx(const char* outfile, int width, int height,
+			int frame_rate_num, int frame_rate_den,
+			int bit_rate, int gop_size, enum CodecID codec_id,
+			int payload_type,
+			MediaPort* mediaPort) throw(MediaException)
+: Media()
+
+{
+	int ret;
+	char buf[256];
+	URLContext *urlContext;
+	RTPMuxContext *rptmc;
+
+	LOG_TAG = "media-video-tx";
+	_mediaPort = mediaPort;
+
+	try {
+#ifndef USE_X264
+		media_log(MEDIA_LOG_INFO, LOG_TAG, "USE_X264 no def");
+		/* TODO: Improve this hack to disable H264 */
+		if (codec_id == CODEC_ID_H264)
+			throw MediaException("H264 not supported");
+#endif
+
+		_fmt = av_guess_format(NULL, outfile, NULL);
+		if (!_fmt) {
+			media_log(MEDIA_LOG_DEBUG, LOG_TAG,
+				"Could not deduce output format from file extension: using RTP.");
+			_fmt = av_guess_format("rtp", NULL, NULL);
+		}
+		if (!_fmt)
+			throw MediaException("Could not find suitable output format");
+
+		media_log(MEDIA_LOG_DEBUG, LOG_TAG, "Format established: %s", _fmt->name);
+		_fmt->video_codec = codec_id;
+
+		/* allocate the output media context */
+		_oc = avformat_alloc_context();
+		if (!_oc)
+			throw MediaException("Memory error: Could not alloc context");
+
+		_oc->oformat = _fmt;
+		snprintf(_oc->filename, sizeof(_oc->filename), "%s", outfile);
+
+		/* add the  video stream using the default format codecs
+		and initialize the codecs */
+		_video_st = NULL;
+
+		if (_fmt->video_codec != CODEC_ID_NONE)
+			_video_st = VideoTx::addVideoStream(_fmt->video_codec, width, height,
+					frame_rate_num, frame_rate_den, bit_rate, gop_size);
+		if(!_video_st)
+			throw MediaException("Can not add video stream");
+
+		/* set the output parameters (must be done even if no
+				parameters). */
+		if (av_set_parameters(_oc, NULL) < 0)
+			throw MediaException("Invalid output format parameters");
+
+		av_dump_format(_oc, 0, outfile, 1);
+
+
+		/* open the output file, if needed */
+		if (!(_fmt->flags & AVFMT_NOFILE)) {
+			if ((ret = avio_open(&_oc->pb, outfile, URL_WRONLY)) < 0) {
+				av_strerror(ret, buf, sizeof(buf));
+				throw MediaException("Could not open '%s': %s", outfile, buf);
+			}
+		}
+
+		//Free old URLContext
+		if ((ret=ffurl_close((URLContext*)_oc->pb->opaque)) < 0)
+			throw MediaException("Could not free URLContext");
+
+		urlContext = _mediaPort->getConnection();
+		if ((ret=rtp_set_remote_url(urlContext, outfile)) < 0) {
+			av_strerror(ret, buf, sizeof(buf));
+			throw MediaException("Could not open '%s': %s", outfile, buf);
+		}
+
+		_oc->pb->opaque = urlContext;
+
+		/* write the stream header, if any */
+		av_write_header(_oc);
+
+		rptmc = (RTPMuxContext*)_oc->priv_data;
+		rptmc->payload_type = payload_type;
+
+		_n_frame = 0;
+		_mutex = new Lock();
+	}
+	catch(MediaException &e) {
+		media_log(MEDIA_LOG_ERROR, LOG_TAG, "%s", e.what());
+		release();
+		throw;
+	}
+}
+
+
 VideoTx::~VideoTx()
 {
 	release();
@@ -214,6 +299,51 @@ VideoTx::putVideoFrameTx(uint8_t* frame, int width, int height, int64_t time)
 	return out_size;
 }
 
+/**
+ * Uses encoded frame
+ * */
+int
+VideoTx::putVideoFrameTxJava(uint8_t* frame, int width, int height,
+				int64_t time, int out_size) throw(MediaException)
+{
+	media_log(MEDIA_LOG_DEBUG, LOG_TAG, "Its going to be written %d bytes",out_size);
+	int ret;
+	AVCodecContext *c;
+	struct SwsContext *img_convert_ctx;
+
+	_mutex->lock();
+	try {
+		if (!_oc)
+			throw MediaException("No video initiated.");
+
+		// Using Java encoded frame
+
+		_video_outbuf = frame;
+
+		if (out_size > 0) {
+				AVPacket pkt;
+				av_init_packet(&pkt);
+				pkt.pts = get_pts(time, _video_st->time_base);
+				pkt.stream_index= _video_st->index;
+				pkt.data= _video_outbuf;
+				pkt.size= out_size;
+				/* write the compressed frame in the media file */
+				ret = av_write_frame(_oc, &pkt);
+		}else {
+				ret = 0;
+		}
+		if (ret < 0)
+			throw MediaException("Could not write video frame");
+	}
+	catch(MediaException &e) {
+		media_log(MEDIA_LOG_ERROR, LOG_TAG, "%s", e.what());
+		_mutex->unlock();
+		throw;
+	}
+
+	_mutex->unlock();
+	return out_size;
+}
 
 /**
  * add a video output stream
@@ -387,7 +517,8 @@ VideoTx::release()
 			avcodec_close(_video_st->codec);
 			av_free(_picture_buf);
 			av_free(_picture);
-			av_free(_tmp_picture);
+			if(_tmp_picture)
+				av_free(_tmp_picture);
 			av_free(_video_outbuf);
 		}
 		/* free the streams */
@@ -399,7 +530,6 @@ VideoTx::release()
 		MediaPortManager::releaseMediaPort(_mediaPort);
 		_oc = NULL;
 	}
-
 	_mutex->unlock();
 	delete _mutex;
 }
