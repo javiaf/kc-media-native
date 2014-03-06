@@ -26,6 +26,7 @@ namespace media {
 		enum PixelFormat _src_pix_fmt;
 
 		Lock *_mutex;
+		int _java;
 
 	public:
 		VideoTx(const char* outfile, int width, int height,
@@ -48,6 +49,7 @@ namespace media {
 					int frame_rate_den, int bit_rate, int gop_size);
 		void openVideo() throw(MediaException);
 		void release();
+		void releaseJava();
 	};
 }
 

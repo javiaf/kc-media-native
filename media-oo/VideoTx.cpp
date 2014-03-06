@@ -28,7 +28,7 @@ VideoTx::VideoTx(const char* outfile, int width, int height,
 
 	LOG_TAG = "media-video-tx";
 	_mediaPort = mediaPort;
-
+	_java = 0;
 	try {
 #ifndef USE_X264
 		media_log(MEDIA_LOG_INFO, LOG_TAG, "USE_X264 no def");
@@ -132,7 +132,7 @@ VideoTx::VideoTx(const char* outfile, int width, int height,
 
 	LOG_TAG = "media-video-tx";
 	_mediaPort = mediaPort;
-
+	_java = 1;
 	try {
 #ifndef USE_X264
 		media_log(MEDIA_LOG_INFO, LOG_TAG, "USE_X264 no def");
@@ -218,7 +218,10 @@ VideoTx::VideoTx(const char* outfile, int width, int height,
 
 VideoTx::~VideoTx()
 {
-	release();
+	if(_java)
+		releaseJava();
+	else
+		release();
 }
 
 /**
@@ -512,13 +515,13 @@ VideoTx::release()
 	* was freed on av_codec_close() */
 	if (_oc) {
 		av_write_trailer(_oc);
+
 		/* close codec */
 		if (_video_st) {
 			avcodec_close(_video_st->codec);
 			av_free(_picture_buf);
 			av_free(_picture);
-			if(_tmp_picture)
-				av_free(_tmp_picture);
+			av_free(_tmp_picture);
 			av_free(_video_outbuf);
 		}
 		/* free the streams */
@@ -529,6 +532,38 @@ VideoTx::release()
 		_mediaPort->closeContext(_oc);
 		MediaPortManager::releaseMediaPort(_mediaPort);
 		_oc = NULL;
+	}
+	_mutex->unlock();
+	delete _mutex;
+}
+
+void
+VideoTx::releaseJava()
+{
+	int i;
+
+	_mutex->lock();
+	/* write the trailer, if any.  the trailer must be written
+	* before you close the CodecContexts open when you wrote the
+	* header; otherwise write_trailer may try to use memory that
+	* was freed on av_codec_close() */
+	if (_oc) {
+		av_write_trailer(_oc);
+
+		/* close codec */
+		if (_video_st) {
+			avcodec_close(_video_st->codec);
+			av_free(_video_outbuf);
+		}
+		/* free the streams */
+		for(i = 0; i < _oc->nb_streams; i++) {
+			av_freep(&_oc->streams[i]->codec);
+			av_freep(&_oc->streams[i]);
+		}
+		_mediaPort->closeContext(_oc);
+		MediaPortManager::releaseMediaPort(_mediaPort);
+		_oc = NULL;
+
 	}
 	_mutex->unlock();
 	delete _mutex;
